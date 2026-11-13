@@ -6,13 +6,119 @@ using JuMP, Gurobi, JSON, Distributions, Polyhedra, CDDLib, Dualization, LinearA
 using GLM, DataFrames, Random, NearestNeighbors, StatsPlots, CSV
 using Plots.Measures
 using SlurmClusterManager
-using JLD2
+using JLD2, Dates
 using Distributed
 
-println("Iniciando trabajadores SLURM...")
+const PROGRESS_FILE = joinpath(pwd(), "results", "progress.json")
+const PROGRESS_HISTORY_FILE = joinpath(
+    pwd(), "results", "progress_history.jsonl"
+)
+const PROGRESS_CHANNEL = RemoteChannel(
+    () -> Channel{Any}(10000), 1
+)
+
+function save_progress(state)
+    mkpath(dirname(PROGRESS_FILE))
+
+    temporal = PROGRESS_FILE * ".tmp"
+
+    open(temporal, "w") do io
+        JSON.print(io, state, 4)
+    end
+
+    mv(temporal, PROGRESS_FILE; force=true)
+end
+
+function save_progress_event(event)
+    mkpath(dirname(PROGRESS_HISTORY_FILE))
+
+    open(PROGRESS_HISTORY_FILE, "a") do io
+        JSON.print(io, event)
+        println(io)
+    end
+end
+
+function start_monitor()
+    state = Dict{String,Any}(
+        "step" => "initialization",
+        "iteration" => 0,
+        "subproblem_iteration" => 0,
+        "last_update" => string(now()),
+        "workers" => nworkers(),
+        "subproblems" => Dict{String,Any}()
+    )
+
+    save_progress(state)
+
+    return @async begin
+        while true
+            event = take!(PROGRESS_CHANNEL)
+            event_type = event["type"]
+
+            save_progress_event(event)
+
+            if event_type == "TERMINATE"
+                state["last_update"] = string(now())
+                save_progress(state)
+                break
+            end
+
+            state["last_update"] = string(now())
+
+            if event_type == "STEP"
+                state["step"] = event["stage"]
+                state["iteration"] = event["iteration"]
+                state["subproblem_iteration"] = 0
+                state["subproblems"] = Dict{String,Any}()
+                delete!(state, "benders")
+
+            elseif event_type == "SUBPROBLEM"
+                if state["subproblem_iteration"] != event["iteration"]
+                    state["subproblems"] = Dict{String,Any}()
+                    state["subproblem_iteration"] = event["iteration"]
+                end
+
+                key = string(event["subproblem"])
+                state["subproblems"][key] = event
+                state["iteration"] = event["iteration"]
+
+            elseif event_type in (
+                "BENDERS",
+                "WARM_BENDERS",
+                "BENDERS_WITHOUT_WARM_START"
+            )
+                state["iteration"] = event["iteration"]
+
+                state["benders"] = Dict(
+                    "LB" => event["LB"],
+                    "UB" => event["UB"],
+                    "gap" => event["gap"]
+                )
+            end
+
+            save_progress(state)
+        end
+    end
+end
+
+println("Starting SLURM workers...")
 flush(stdout)
 
 addprocs(SlurmClusterManager.SlurmManager())
+
+println("Julia processes: ", nprocs())
+println("Workers Julia: ", nworkers())
+
+@everywhere using Dates
+@everywhere const WORKER_PROGRESS_CHANNEL = $PROGRESS_CHANNEL
+
+monitor_task = start_monitor()
+
+put!(PROGRESS_CHANNEL, Dict(
+    "type" => "STEP",
+    "stage" => "Benders inicial",
+    "iteration" => 0
+))
 
 println("Number of workers: ", nworkers())
 
@@ -458,6 +564,20 @@ end
 
 @everywhere function solve_oracle_problem(data, iter, n)
 
+    start = time()
+
+    put!(WORKER_PROGRESS_CHANNEL, Dict(
+        "type" => "SUBPROBLEM",
+        "iteration" => iter,
+        "subproblem" => n,
+        "state" => "RUNNING",
+        "worker" => myid(),
+        "node" => gethostname(),
+        "start" => string(now()),
+        "finish" => nothing,
+        "duration_seconds" => nothing
+    ))
+
     Data = data.Data
     D = Data.D
     z = data.z
@@ -610,6 +730,18 @@ end
     result = (
         oracle_solution = oracle_solution,
     )
+
+    put!(WORKER_PROGRESS_CHANNEL, Dict(
+        "type" => "SUBPROBLEM",
+        "iteration" => iter,
+        "subproblem" => n,
+        "state" => "COMPLETED",
+        "worker" => myid(),
+        "node" => gethostname(),
+        "start" => string(now() - Millisecond(round(Int, (time() - start) * 1000))),
+        "finish" => string(now()),
+        "duration_seconds" => round(time() - start, digits=2)
+    ))
 
     return result
     
@@ -1504,6 +1636,14 @@ while ~convergence && iter ≤ Max_iter  && gap ≥ 1e-3
 
     gap = (UB_Benders - LB_Benders)/UB_Benders
 
+    put!(PROGRESS_CHANNEL, Dict(
+        "type" => "BENDERS",
+        "iteration" => iter,
+        "LB" => LB_Benders,
+        "UB" => UB_Benders,
+        "gap" => gap
+    ))
+
 end
 
 df_first_stage = DataFrame(first_stage_history)
@@ -1519,9 +1659,15 @@ jldsave("results/iterations.jlds"; iter)
 
 println("Benders converged...")
 
+put!(PROGRESS_CHANNEL, Dict(
+    "type" => "STEP",
+    "stage" => "Warm Start",
+    "iteration" => 0
+))
+
 # New context
 
-cuts_Benders = load("results/cuts_Benders.jld2", "cuts_Benders")
+# cuts_Benders = load("results/cuts_Benders.jld2", "cuts_Benders")
 ϵ = 0.1
 zstar_new_ = vcat(zstar...) .+ (rand(length(vcat(zstar...))) .- 0.5) .* (2 * ϵ)
 zstar_new = @views [zstar_new_[((b - 1) * Tf + 1):(b * Tf)] for b in 1:length(bus_renewable_generation)]
@@ -1694,10 +1840,16 @@ while ~convergence_warm &&  iter_warm ≤ Max_iter && gap_warm ≥1e-3
     push!(UpperBound_warm, UB_Benders_warm)
     push!(Time_warm, (time_master_Benders_warm, total_time_oracle_warm, total_time_warm))
 
-    if iter_warm > 1
-        convergence_warm = ~Base.any(violation_warm)
-        gap_warm =( UB_Benders_warm - LB_Benders_warm)/UB_Benders_warm
-    end
+    convergence_warm = ~Base.any(violation_warm)
+    gap_warm = ( UB_Benders_warm - LB_Benders_warm)/UB_Benders_warm
+
+    put!(PROGRESS_CHANNEL, Dict(
+        "type" => "WARM_BENDERS",
+        "iteration" => iter_warm,
+        "LB" => LB_Benders_warm,
+        "UB" => UB_Benders_warm,
+        "gap" => gap_warm
+    ))
 
     iter_warm +=  1
 
@@ -1715,6 +1867,12 @@ jldsave("results/iterations_warm.jlds"; iter_warm)
 
 
 println("Benders with warm star converged...")
+
+put!(PROGRESS_CHANNEL, Dict(
+    "type" => "STEP",
+    "stage" => "Without Warm Start",
+    "iteration" => 0
+))
 
 oracle_dict_new = Dict("y" => Dict("$n" => [zeros(Tf) for b ∈ collect(1:Tb_renewable)] for n ∈ sample), "π" => Dict("$n" => Dict("($b, $t)" => 0.0  for b in bus_renewable_generation, t in T) for n ∈ sample), "π_s" => Dict("$n" => Dict("($b, $t)" => 0.0  for b in bus_renewable_generation, t in T) for n ∈ sample), "x1" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in T) for n ∈ sample), "x2" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in T) for n ∈ sample), "x3" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in T[2:end]) for n ∈ sample), "x4" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in T[2:end]) for n ∈ sample), "x5" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in [1]) for n ∈ sample), "x6" => Dict("$n" => Dict("($i, $t)" => 0.0 for i in Ig, t in [1]) for n ∈ sample), "const" => Dict("$n" => 0.0 for n ∈ sample), "time" => Dict("$n" => 0.0 for n ∈ sample), "ϑ" => zeros(N))
 cuts_Benders_new = Dict("$n" => NamedTuple[] for n in sample)
@@ -1872,10 +2030,16 @@ while ~convergence_new &&  iter_new ≤ Max_iter && gap_new ≥ 1e-3
     push!(UpperBound_new, UB_Benders_new)
     push!(Time_new, (time_master_Benders_new, total_time_oracle_new, total_time_new))
 
-    if iter_new > 1
-        convergence_new = ~Base.any(violation_new)
-        gap_new =( UB_Benders_new - LB_Benders_new)/UB_Benders_new
-    end
+    convergence_new = ~Base.any(violation_new)
+    gap_new =( UB_Benders_new - LB_Benders_new)/UB_Benders_new
+
+    put!(PROGRESS_CHANNEL, Dict(
+        "type" => "BENDERS_WITHOUT_WARM_START",
+        "iteration" => iter_new,
+        "LB" => LB_Benders_new,
+        "UB" => UB_Benders_new,
+        "gap" => gap_new
+    ))
 
     iter_new +=  1
 
@@ -1892,3 +2056,15 @@ jldsave("results/cumulative_time_new.jld2"; cumulative_time_new)
 jldsave("results/iterations_new.jlds"; iter_new)
 
 println("Benders without warm star converged...")
+
+put!(PROGRESS_CHANNEL, Dict(
+    "type" => "STEP",
+    "stage" => "COMPLETED",
+    "iteration" => 0
+))
+
+put!(PROGRESS_CHANNEL, Dict(
+    "type" => "TERMINATE"
+))
+
+wait(monitor_task)

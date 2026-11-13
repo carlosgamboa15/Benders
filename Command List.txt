@@ -1,0 +1,23 @@
+/mnt/home/users/tep_144_uma/cgamboa/Large_Scale_Picasso
+
+scp -r cgamboa@picasso.scbi.um.es:/mnt/home/users/tep_144_uma/cgamboa/Large_Scale_Picasso ./results_anterior # guardar archivos en la máquina local
+
+scp main.jl cgamboa@picasso.scbi.uma.es:/mnt/home/users/tep_144_uma/cgamboa/Large_Scale_Picasso/main.jl # actualizar archivo local en Picasso
+
+julia --project=. -e 'using JSON; println("JSON OK")'
+
+julia --project=. -e 'Meta.parseall(read("main.jl", String)); println("Sintaxis OK")' # verificar si el archivo tiene sintaxis OK
+
+watch -n 2 'cat results/progress.json' # acompañar json de progreso
+
+tail -f julia_ID.out # acompañar salida
+
+tail -f julia_ID.err # acompañar reporte de errores
+
+tail -f julia_ID.out julia_ID.err # acompañar al mismo tiempo
+
+sed -i 's/\r$//' execute_julia.sh # corregir error de espacios de Windows
+
+python3 -m json.tool results/progress.json | less # para acompañar el json de progreso
+
+Submitted batch job 3657788
