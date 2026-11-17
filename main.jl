@@ -70,7 +70,9 @@ function start_monitor()
                 state["iteration"] = event["iteration"]
                 state["subproblem_iteration"] = 0
                 state["subproblems"] = Dict{String,Any}()
-                delete!(state, "benders")
+                for key in ("benders", "master", "oracles", "cuts")
+                    delete!(state, key)
+                end
 
             elseif event_type == "SUBPROBLEM"
                 if state["subproblem_iteration"] != event["iteration"]
@@ -80,6 +82,9 @@ function start_monitor()
 
                 key = string(event["subproblem"])
                 state["subproblems"][key] = event
+                state["iteration"] = event["iteration"]
+            elseif event_type == "MASTER"
+                state["master"] = event
                 state["iteration"] = event["iteration"]
 
             elseif event_type in (
@@ -1283,7 +1288,16 @@ function warm_start_solution_Benders(Data, m_master_warm, z, zstar_new, y, Ξ_y_
  
 end
 
-function solve_master_problem(m_master)
+function solve_master_problem(m_master, iter)
+
+    master_start = time()
+
+    put!(PROGRESS_CHANNEL, Dict(
+        "type" => "MASTER",
+        "iteration" => iter,
+        "state" => "RUNNING",
+        "start" => string(now())
+    ))
 
     val, time_master = @timed(begin
         optimize!(m_master)
@@ -1292,6 +1306,14 @@ function solve_master_problem(m_master)
             error("problem $status")
         end
     end) 
+
+    put!(PROGRESS_CHANNEL, Dict(
+    "type" => "MASTER",
+    "iteration" => iter,
+    "state" => "COMPLETED",
+    "finish" => string(now()),
+    "duration_seconds" => round(time() - master_start, digits=2)
+))
 
     # Solution
     u = value.(m_master[:u])
@@ -1527,7 +1549,7 @@ while ~convergence && iter ≤ Max_iter  && gap ≥ 1e-3
     global LB_Benders, UB_Benders
     global cumulative_time, iter, gap
 
-    global u_Benders, v_Benders, w_Benders, λ_Benders, μ_Benders, θ_Benders, LB_Benders_, time_master_Benders = solve_master_problem(m_master)
+    global u_Benders, v_Benders, w_Benders, λ_Benders, μ_Benders, θ_Benders, LB_Benders_, time_master_Benders = solve_master_problem(m_master, iter)
 
     u_current = Dict(
         (i,t) => u_Benders[i, t]
@@ -1735,7 +1757,7 @@ while ~convergence_warm &&  iter_warm ≤ Max_iter && gap_warm ≥1e-3
     if iter_warm == 1
         global u_Benders_warm, v_Benders_warm, w_Benders_warm, λ_Benders_warm, μ_Benders_warm, θ_Benders_warm, LB_Benders_warm, time_master_Benders_warm = warm_start_solution_Benders(Data, m_master_warm, z, zstar_new, y, Ξ_y_new, PredictionStar_new,  cuts_Benders)
     else                                                                
-        global u_Benders_warm, v_Benders_warm, w_Benders_warm, λ_Benders_warm, μ_Benders_warm, θ_Benders_warm, LB_Benders_warm, time_master_Benders_warm = solve_master_problem(m_master_warm)
+        global u_Benders_warm, v_Benders_warm, w_Benders_warm, λ_Benders_warm, μ_Benders_warm, θ_Benders_warm, LB_Benders_warm, time_master_Benders_warm = solve_master_problem(m_master_warm, iter_warm)
     end
 
     u_current_warm = Dict(
@@ -1784,7 +1806,7 @@ while ~convergence_warm &&  iter_warm ≤ Max_iter && gap_warm ≥1e-3
         delta_w = delta_w_warm
     ))
 
-    master_solution = (
+    master_solution_warm = (
         u = round.(Int, u_Benders_warm),
         v = v_Benders_warm,
         w = w_Benders_warm,
@@ -1820,7 +1842,7 @@ while ~convergence_warm &&  iter_warm ≤ Max_iter && gap_warm ≥1e-3
         print("iteration = $iter_warm, feasibility for $(N - sum(violation_warm)) subproblems\n")
     end
 
-    master_solution_dict_warm["$iter_warm"] = master_solution
+    master_solution_dict_warm["$iter_warm"] = master_solution_warm
     fill_oracle_dict(Data, result, oracle_dict_warm)
 
     UB_Benders_warm = minimum([UB_Benders_warm, Upper_Bound(Data, u_Benders_warm, v_Benders_warm, w_Benders_warm, λ_Benders_warm, oracle_dict_warm["ϑ"], ρ_new, α)])
@@ -1890,7 +1912,7 @@ Max_iter = 350
 cumulative_time_new = 0.0
 UB_Benders_new= Inf
 
-master_solution = (
+master_solution_new = (
     u = zeros(Ig[end], T[end]),
     v = zeros(Ig[end], T[end]),
     w = zeros(Ig[end], T[end]),
@@ -1899,7 +1921,7 @@ master_solution = (
     μ = zeros(N)
 )
 
-master_solution_dict_new = Dict("$iter" => master_solution for iter ∈ 1:Max_iter)
+master_solution_dict_new = Dict("$iter" => master_solution_new for iter ∈ 1:Max_iter)
 
 gap_new = Inf
 
@@ -1926,7 +1948,7 @@ while ~convergence_new &&  iter_new ≤ Max_iter && gap_new ≥ 1e-3
     global LB_Benders_new, UB_Benders_new
     global cumulative_time_new, iter_new, gap_new
 
-    global u_Benders_new, v_Benders_new, w_Benders_new, λ_Benders_new, μ_Benders_new, θ_Benders_new, LB_Benders_new, time_master_Benders_new = solve_master_problem(m_master_new)
+    global u_Benders_new, v_Benders_new, w_Benders_new, λ_Benders_new, μ_Benders_new, θ_Benders_new, LB_Benders_new, time_master_Benders_new = solve_master_problem(m_master_new, iter_new)
 
     u_current_new = Dict(
         (i,t) => u_Benders_new[i, t]
@@ -1974,7 +1996,7 @@ while ~convergence_new &&  iter_new ≤ Max_iter && gap_new ≥ 1e-3
         delta_w = delta_w_new
     ))
 
-    master_solution = (
+    master_solution_new = (
         u = round.(Int, u_Benders_new),
         v = v_Benders_new,
         w = w_Benders_new,
@@ -2010,7 +2032,7 @@ while ~convergence_new &&  iter_new ≤ Max_iter && gap_new ≥ 1e-3
         print("iteration = $iter_new, feasibility for $(N - sum(violation_new)) subproblems\n")
     end
 
-    master_solution_dict_new["$iter_new"] = master_solution
+    master_solution_dict_new["$iter_new"] = master_solution_new
     fill_oracle_dict(Data, result, oracle_dict_new)
 
     UB_Benders_new = minimum([UB_Benders_new, Upper_Bound(Data, u_Benders_new, v_Benders_new, w_Benders_new, λ_Benders_new, oracle_dict_new["ϑ"], ρ_new, α)])
