@@ -140,7 +140,7 @@ end
 println("Starting SLURM workers...")
 flush(stdout)
 
-addprocs(SlurmClusterManager.SlurmManager())
+addprocs(1)
 
 println("Julia processes: ", nprocs())
 println("Workers Julia: ", nworkers())
@@ -202,6 +202,38 @@ end
         end
     catch
     end
+
+    return nothing
+end
+
+@everywhere function report_oracle(
+    iter,
+    n,
+    start,
+    start_datetime,
+    state;
+    formulation = nothing,
+    extra = Dict{String,Any}()
+)
+
+    event = Dict{String,Any}(
+        "type" => "SUBPROBLEM",
+        "iteration" => iter,
+        "subproblem" => n,
+        "state" => state,
+        "formulation" => formulation,
+        "worker" => myid(),
+        "node" => gethostname(),
+        "start" => start_datetime,
+        "finish" => nothing,
+        "duration_seconds" => round(time() - start, digits=2),
+        "memory_gb" => memory_rss_gb(),
+        "memory_peak_gb" => memory_peak_gb()
+    )
+
+    merge!(event, extra)
+
+    put!(WORKER_PROGRESS_CHANNEL, event)
 
     return nothing
 end
@@ -396,8 +428,6 @@ end
     @variable(model, p[1:Ig[end], 1:T[end]] >= 0) # generation
     @variable(model, pdef[1:Tb, 1:T[end]] >= 0) # deficit generation
     @variable(model, s[bus_renewable_generation, 1:T[end]] >= 0) # spillage
-    @variable(model, s_positivo[b in bus_renewable_generation, t in T] >= 0)
-    @variable(model, s_negativo[b in bus_renewable_generation, t in T] >= 0)
 
     @constraint(model, [t in T], f[:, t] .== S*β[:, t])
     @constraint(model, [b in Bus, t in T], B[b,:]'*p[:, t] + F[b,:]'*f[:, t] + pdef[b, t] == D[b][t]) # Power balance
@@ -570,7 +600,7 @@ end
 
             for b in bus_renewable_generation
 
-                REG = maximum([PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t], 0.0])
+                REG = PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]
 
                 set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
                 set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
@@ -599,10 +629,10 @@ end
 
     M = 1e6
     L, U = -M, M
-    L_s, U_s = 0, M
+    L_s, U_s = -M, 0.0
 
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L ≤ m_oracle[Symbol("π[$b,$t]")] ≤ U)
-    @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L ≤ m_oracle[Symbol("π_s[$b,$t]")] ≤ U)
+    @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L_s <= m_oracle[Symbol("π_s[$b,$t]")] <= U_s)
 
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], ωpos[b, t] ≥ L*m_oracle[:ηpos][b, t])
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], ωpos[b, t] ≤ U*m_oracle[:ηpos][b, t])
@@ -626,31 +656,421 @@ end
 
 end
 
+@everywhere function modify_oracle_inidicator_constraints(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+
+    Tf = Data.Tf
+    number_of_generators = Data.Ig
+    D = Data.D
+    Pmin = Data.Pmin
+    Pmax = Data.Pmax
+    RD = Data.RD
+    RU = Data.RU
+    p0 = zeros(number_of_generators)
+    u0 = zeros(number_of_generators)
+    bus_renewable_generation = Data.bus_renewable_generation
+    ind_renewable_generation = Data.ind_renewable_generation
+    T = collect(1:Tf)
+    Ig = collect(1:number_of_generators)
+    Tb_renewable = length(bus_renewable_generation)
+
+    y_n = y[n]
+
+    lower = max.(Ξ_y[:,1], -vcat(PredictionStar...))
+    upper = Ξ_y[:,2]
+
+    yproj_aux = clamp.(y_n, lower, upper)
+    Δpos_aux = upper - yproj_aux
+    Δneg_aux = yproj_aux - lower
+
+    yproj = @views [yproj_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
+
+    Δpos = @views [Δpos_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
+    Δneg = @views [Δneg_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
+
+    @variable(m_oracle, ωpos[b ∈ bus_renewable_generation, t ∈ T])
+    @variable(m_oracle, ωneg[b ∈ bus_renewable_generation, t ∈ T])
+    @variable(m_oracle, τpos[b ∈ bus_renewable_generation, t ∈ T])
+    @variable(m_oracle, τneg[b ∈ bus_renewable_generation, t ∈ T])
+
+    ex = sum(m_oracle[Symbol("π[$b,$t]")] *( D[b][t] - (PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t])) -Δpos[ind_renewable_generation[b]][t] * m_oracle[:ωpos][b, t] + Δneg[ind_renewable_generation[b]][t] * m_oracle[:ωneg][b, t] + m_oracle[Symbol("π_s[$b,$t]")] * ( PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]) + Δpos[ind_renewable_generation[b]][t] * m_oracle[:τpos][b, t] - Δneg[ind_renewable_generation[b]][t] * m_oracle[:τneg][b, t] - λ*Δpos[ind_renewable_generation[b]][t] * m_oracle[:ηpos][b, t] - λ*Δneg[ind_renewable_generation[b]][t] * m_oracle[:ηneg][b, t] for b ∈ bus_renewable_generation, t ∈ T)
+
+    set_objective_function(m_oracle, obj + ex - λ * norm(yproj_aux - y_n, 1))
+
+    for t in T
+
+            for b in bus_renewable_generation
+
+                REG = PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]
+
+                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
+                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
+                set_normalized_rhs(m_oracle[:positive][b, t], REG)
+
+            end
+
+        for i in Ig
+
+            set_objective_coefficient(m_oracle, m_oracle[Symbol("x1[$i,$t]")], Pmax[i]*round(Int, u[i, t]))
+            set_objective_coefficient(m_oracle, m_oracle[Symbol("x2[$i,$t]")], Pmin[i]*round(Int, u[i, t]))
+
+            if t == 1
+
+                set_objective_coefficient(m_oracle, m_oracle[Symbol("x5[$i,$t]")], RU[i]*u0[i] + Pmax[i]*round(Int,v[i, t]) + p0[i])
+                set_objective_coefficient(m_oracle, m_oracle[Symbol("x6[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]) - p0[i])                
+
+            else
+
+                set_objective_coefficient(m_oracle, m_oracle[Symbol("x3[$i,$t]")], RU[i]*round(Int, u[i, t-1]) + Pmax[i]*round(Int, v[i, t]))
+                set_objective_coefficient(m_oracle, m_oracle[Symbol("x4[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]))
+
+            end
+        end
+    end
+
+    M = 1e6
+
+    ηpos = m_oracle[:ηpos]
+    ηneg = m_oracle[:ηneg]
+
+    for b in bus_renewable_generation, t in T
+
+        π_bt  = m_oracle[Symbol("π[$b,$t]")]
+        πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
+
+        @assert is_binary(ηpos[b,t])
+        @assert is_binary(ηneg[b,t])
+
+        @constraint(m_oracle, -M <= π_bt <= M)
+        @constraint(m_oracle, -M <= πs_bt <= 0)
+
+        # ωpos = π * ηpos
+        @constraint(m_oracle, !ηpos[b,t] --> {ωpos[b,t] == 0})
+        @constraint(m_oracle,  ηpos[b,t] --> {ωpos[b,t] == π_bt})
+
+        # ωneg = π * ηneg
+        @constraint(m_oracle, !ηneg[b,t] --> {ωneg[b,t] == 0})
+        @constraint(m_oracle,  ηneg[b,t] --> {ωneg[b,t] == π_bt})
+
+        # τpos = π_s * ηpos
+        @constraint(m_oracle, !ηpos[b,t] --> {τpos[b,t] == 0})
+        @constraint(m_oracle,  ηpos[b,t] --> {τpos[b,t] == πs_bt})
+
+        # τneg = π_s * ηneg
+        @constraint(m_oracle, !ηneg[b,t] --> {τneg[b,t] == 0})
+        @constraint(m_oracle,  ηneg[b,t] --> {τneg[b,t] == πs_bt})
+
+    end
+
+end
+
+@everywhere function modify_oracle_bilinear(Data, m_oracle, obj, y, Ξ_y, n, u, v, w, λ, PredictionStar)
+
+    Tf = Data.Tf
+    number_of_generators = Data.Ig
+    D = Data.D
+    Pmin = Data.Pmin
+    Pmax = Data.Pmax
+    RD = Data.RD
+    RU = Data.RU
+
+    p0 = zeros(number_of_generators)
+    u0 = zeros(number_of_generators)
+
+    bus_renewable_generation = Data.bus_renewable_generation
+    ind_renewable_generation = Data.ind_renewable_generation
+
+    T = collect(1:Tf)
+    Ig = collect(1:number_of_generators)
+    Tb_renewable = length(bus_renewable_generation)
+
+    y_n = y[n]
+
+    lower = max.(Ξ_y[:, 1], -vcat(PredictionStar...))
+    upper = Ξ_y[:, 2]
+
+    yproj_aux = clamp.(y_n, lower, upper)
+    Δpos_aux = upper - yproj_aux
+    Δneg_aux = yproj_aux - lower
+
+    yproj = @views [
+        yproj_aux[((b - 1) * Tf + 1):(b * Tf)]
+        for b in 1:Tb_renewable
+    ]
+
+    Δpos = @views [
+        Δpos_aux[((b - 1) * Tf + 1):(b * Tf)]
+        for b in 1:Tb_renewable
+    ]
+
+    Δneg = @views [
+        Δneg_aux[((b - 1) * Tf + 1):(b * Tf)]
+        for b in 1:Tb_renewable
+    ]
+
+    ηpos = m_oracle[:ηpos]
+    ηneg = m_oracle[:ηneg]
+
+    set_optimizer_attribute(m_oracle, "NonConvex", 2)
+
+    M = 1e6
+
+    for b in bus_renewable_generation, t in T
+
+        π_bt  = m_oracle[Symbol("π[$b,$t]")]
+        πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
+
+        @constraint(m_oracle, -M <= π_bt <= M)
+        @constraint(m_oracle, -M <= πs_bt <= 0)
+
+    end
+
+    ex = sum(
+        begin
+            r = ind_renewable_generation[b]
+
+            π_bt  = m_oracle[Symbol("π[$b,$t]")]
+            πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
+
+            REG = PredictionStar[r][t] + yproj[r][t]
+
+            Δp = Δpos[r][t]
+            Δn = Δneg[r][t]
+
+            π_bt * (D[b][t] - REG)
+
+            - Δp * π_bt * ηpos[b,t]
+            + Δn * π_bt * ηneg[b,t]
+
+            + πs_bt * REG
+
+            + Δp * πs_bt * ηpos[b,t]
+            - Δn * πs_bt * ηneg[b,t]
+
+            - λ * Δp * ηpos[b,t]
+            - λ * Δn * ηneg[b,t]
+        end
+        for b in bus_renewable_generation, t in T
+    )
+
+    set_objective_function(
+        m_oracle,
+        obj + ex - λ * norm(yproj_aux - y_n, 1)
+    )
+
+    for t in T
+
+        for b in bus_renewable_generation
+
+            r = ind_renewable_generation[b]
+
+            REG = PredictionStar[r][t] + yproj[r][t]
+
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                ηpos[b,t],
+                -Δpos[r][t]
+            )
+
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                ηneg[b,t],
+                Δneg[r][t]
+            )
+
+            set_normalized_rhs(
+                m_oracle[:positive][b,t],
+                REG
+            )
+
+        end
+
+        for i in Ig
+
+            set_objective_coefficient(
+                m_oracle,
+                m_oracle[Symbol("x1[$i,$t]")],
+                Pmax[i] * round(Int, u[i,t])
+            )
+
+            set_objective_coefficient(
+                m_oracle,
+                m_oracle[Symbol("x2[$i,$t]")],
+                Pmin[i] * round(Int, u[i,t])
+            )
+
+            if t == 1
+
+                set_objective_coefficient(
+                    m_oracle,
+                    m_oracle[Symbol("x5[$i,$t]")],
+                    RU[i] * u0[i] +
+                    Pmax[i] * round(Int, v[i,t]) +
+                    p0[i]
+                )
+
+                set_objective_coefficient(
+                    m_oracle,
+                    m_oracle[Symbol("x6[$i,$t]")],
+                    RD[i] * round(Int, u[i,t]) +
+                    Pmax[i] * round(Int, w[i,t]) -
+                    p0[i]
+                )
+
+            else
+
+                set_objective_coefficient(
+                    m_oracle,
+                    m_oracle[Symbol("x3[$i,$t]")],
+                    RU[i] * round(Int, u[i,t-1]) +
+                    Pmax[i] * round(Int, v[i,t])
+                )
+
+                set_objective_coefficient(
+                    m_oracle,
+                    m_oracle[Symbol("x4[$i,$t]")],
+                    RD[i] * round(Int, u[i,t]) +
+                    Pmax[i] * round(Int, w[i,t])
+                )
+
+            end
+        end
+    end
+
+end
+
+
+@everywhere function solve_oracle_formulation(
+    data, iter, n, formulation::Symbol
+)
+    Data = data.Data
+
+    log_dir = joinpath(
+        pwd(), "results", "oracle_comparison",
+        String(formulation), "gurobi_logs"
+    )
+    mkpath(log_dir)
+
+    log_file = joinpath(
+        log_dir,
+        "oracle_iter$(iter)_n$(n).log"
+    )
+
+    build_start = time()
+    m_oracle, obj = create_oracle_problem(Data)
+
+    set_optimizer(
+        m_oracle,
+        optimizer_with_attributes(
+            () -> Gurobi.Optimizer(GUROBI_ENV),
+            "OutputFlag" => 1,
+            "LogToConsole" => 0,
+            "LogFile" => log_file,
+            "MIPGap" => 1e-3,
+            "TimeLimit" => 1800.0,
+            "Threads" => 1,
+            "Seed" => 1,
+            "NonConvex" => 2
+        )
+    )
+
+    time_build = time() - build_start
+
+    modify_start = time()
+
+    if formulation == :bigm
+        modify_oracle_linearized(
+            Data, m_oracle, obj,
+            data.y, data.Ξ_y, n,
+            data.u, data.v, data.w,
+            data.λ, data.PredictionStar
+        )
+
+    elseif formulation == :indicators
+        modify_oracle_inidicator_constraints(
+            Data, m_oracle, obj,
+            data.y, data.Ξ_y, n,
+            data.u, data.v, data.w,
+            data.λ, data.PredictionStar
+        )
+
+    elseif formulation == :bilinear
+        modify_oracle_bilinear(
+            Data, m_oracle, obj,
+            data.y, data.Ξ_y, n,
+            data.u, data.v, data.w,
+            data.λ, data.PredictionStar
+        )
+
+    else
+        error("Formulación desconocida: $formulation")
+    end
+
+    time_modify = time() - modify_start
+
+    optimize_start = time()
+    optimize!(m_oracle)
+    time_optimize = time() - optimize_start
+
+    status = termination_status(m_oracle)
+    feasible = has_values(m_oracle)
+
+    obj_value = feasible ? objective_value(m_oracle) : nothing
+
+    obj_bound = try
+        objective_bound(m_oracle)
+    catch
+        nothing
+    end
+
+    gap = if feasible &&
+             obj_bound !== nothing &&
+             isfinite(obj_bound) &&
+             isfinite(obj_value)
+        abs(obj_bound - obj_value) /
+            max(abs(obj_value), 1e-10)
+    else
+        nothing
+    end
+
+    nodes = try
+        node_count(m_oracle)
+    catch
+        nothing
+    end
+
+    metrics = (
+        iteration = iter,
+        scenario = n,
+        formulation = String(formulation),
+        status = string(status),
+        has_solution = feasible,
+        objective_value = obj_value,
+        objective_bound = obj_bound,
+        relative_gap = gap,
+        node_count = nodes,
+        time_build = time_build,
+        time_modify = time_modify,
+        time_optimize = time_optimize,
+        log_file = log_file
+    )
+
+    return (
+        model = m_oracle,
+        metrics = metrics,
+        status = status
+    )
+end
+
+
 @everywhere function solve_oracle_problem(data, iter, n)
 
     start = time()
     start_datetime = string(now())
 
-    function report_oracle(state; extra=Dict{String,Any}())
-        event = Dict{String,Any}(
-            "type" => "SUBPROBLEM",
-            "iteration" => iter,
-            "subproblem" => n,
-            "state" => state,
-            "worker" => myid(),
-            "node" => gethostname(),
-            "start" => start_datetime,
-            "finish" => nothing,
-            "duration_seconds" => round(time() - start, digits=2),
-            "memory_gb" => memory_rss_gb(),
-            "memory_peak_gb" => memory_peak_gb()
-        )
-
-        merge!(event, extra)
-        put!(WORKER_PROGRESS_CHANNEL, event)
-    end
-
-    report_oracle("RUNNING")
+    
+    report_oracle(
+        iter, n, start, start_datetime, "RUNNING"
+    )
 
     Data = data.Data
     D = Data.D
@@ -690,81 +1110,148 @@ end
 
     violation = true
 
-   report_oracle("BUILDING")
-
-    build_start = time()
-
-    m_oracle, obj = create_oracle_problem(Data)
-
-    set_optimizer(
-        m_oracle,
-        optimizer_with_attributes(
-            () -> Gurobi.Optimizer(GUROBI_ENV),
-            "OutputFlag" => 0,
-            "MIPGap" => 1e-3,
-            "Threads" => 1
-        )
-    )
-
-    time_build = time() - build_start
-
     report_oracle(
-        "BUILT",
-        extra=Dict(
-            "time_build_seconds" => round(time_build, digits=2)
+        iter, n, start, start_datetime,
+        "OPTIMIZING";
+        formulation = "bigm"
+    )
+
+    bigm = solve_oracle_formulation(
+        data, iter, n, :bigm
+    )
+
+    m_oracle = bigm.model
+    bigm_metrics = bigm.metrics
+
+    if bigm.status != MOI.OPTIMAL
+
+        report_oracle(
+            iter, n, start, start_datetime,
+            "FAILED";
+            formulation = "bigm",
+            extra = Dict{String,Any}(
+                "finish" => string(now()),
+                "termination_status" => string(bigm.status),
+                "objective_value" => bigm_metrics.objective_value,
+                "objective_bound" => bigm_metrics.objective_bound,
+                "relative_gap" => bigm_metrics.relative_gap
+            )
         )
-    )
 
-    report_oracle("MODIFYING")
-
-    modify_start = time()
-
-    modify_oracle_linearized(
-        Data, m_oracle, obj, y, Ξ_y, n,
-        u, v, w, λ, PredictionStar
-    )
-
-    time_modify = time() - modify_start
-
-    report_oracle(
-        "MODIFIED",
-        extra=Dict(
-            "time_modify_seconds" => round(time_modify, digits=2)
+        error(
+            "Big-M no alcanzó la tolerancia: " *
+            "iter=$iter, n=$n, status=$(bigm.status)"
         )
-    )
-
-    report_oracle("OPTIMIZING")
-
-    optimize_start = time()
-
-    optimize!(m_oracle)
-
-    time_optimize = time() - optimize_start
-
-    status = termination_status(m_oracle)
-
-    report_oracle(
-        "OPTIMIZED",
-        extra=Dict(
-            "time_optimize_seconds" => round(time_optimize, digits=2),
-            "termination_status" => string(status)
-        )
-    )
-
-    if status != MOI.OPTIMAL
-        error("Subproblem n = $n, Oracle Status: $(status)")
     end
+
+    report_oracle(
+        iter, n, start, start_datetime,
+        "FORMULATION_COMPLETED";
+        formulation = "bigm",
+        extra = Dict{String,Any}(
+            "termination_status" => string(bigm.status),
+            "time_optimize_seconds" =>
+                bigm_metrics.time_optimize
+        )
+    )
+
+    comparison_metrics = Any[bigm_metrics]
+
+    for formulation in (:indicators, :bilinear)
+
+        report_oracle(
+            iter, n, start, start_datetime,
+            "OPTIMIZING";
+            formulation = String(formulation)
+        )
+
+        try
+            trial = solve_oracle_formulation(
+                data, iter, n, formulation
+            )
+
+            push!(comparison_metrics, trial.metrics)
+
+            report_oracle(
+                iter, n, start, start_datetime,
+                "FORMULATION_COMPLETED";
+                formulation = String(formulation),
+                extra = Dict{String,Any}(
+                    "termination_status" =>
+                        string(trial.status),
+                    "time_optimize_seconds" =>
+                        trial.metrics.time_optimize
+                )
+            )
+
+        catch err
+
+            error_message = sprint(showerror, err)
+
+            push!(
+                comparison_metrics,
+                (
+                    iteration = iter,
+                    scenario = n,
+                    formulation = String(formulation),
+                    status = "ERROR",
+                    error = error_message
+                )
+            )
+
+            report_oracle(
+                iter, n, start, start_datetime,
+                "FORMULATION_FAILED";
+                formulation = String(formulation),
+                extra = Dict{String,Any}(
+                    "error" => error_message
+                )
+            )
+
+        end
+    end
+
+    comparison_dir = joinpath(
+        pwd(), "results", "oracle_comparison"
+    )
+
+    mkpath(comparison_dir)
+
+    comparison_file = joinpath(
+        comparison_dir,
+        "comparison_iter$(iter)_n$(n).txt"
+    )
+
+    open(comparison_file, "w") do io
+        for metrics in comparison_metrics
+            println(io, metrics)
+        end
+    end
+
+    time_build = bigm_metrics.time_build
+    time_modify = bigm_metrics.time_modify
+    time_optimize = bigm_metrics.time_optimize
 
     time_oracle = time_modify + time_optimize
 
-    println(
-        "Oracle n=$n | ",
-        "build=$(round(time_build, digits=2)) s | ",
-        "modify=$(round(time_modify, digits=2)) s | ",
-        "optimize=$(round(time_optimize, digits=2)) s | ",
-        "memory=$(memory_rss_gb()) GiB"
+    report_oracle(
+        iter, n, start, start_datetime,
+        "OPTIMIZED";
+        formulation = "bigm",
+        extra = Dict{String,Any}(
+            "time_build_seconds" => time_build,
+            "time_modify_seconds" => time_modify,
+            "time_optimize_seconds" => time_optimize,
+            "termination_status" => string(bigm.status),
+            "comparison_file" => comparison_file
+        )
     )
 
+    println(
+        "Oracle n=$n | ",
+        "Big-M=$(round(time_optimize, digits=2)) s | ",
+        "Comparación: ", comparison_file
+    )
     obj_val = objective_value(m_oracle)
     viol = μ[n] + θ - obj_val + λ*norm(zstar_global - z[n],1)
     yproj = clamp.(y[n], a, b)  
@@ -865,8 +1352,9 @@ end
     )
 
     report_oracle(
-        "COMPLETED",
-        extra=Dict(
+        iter, n, start, start_datetime,
+        "COMPLETED";
+        extra = Dict{String,Any}(
             "finish" => string(now()),
             "duration_seconds" => round(time() - start, digits=2),
             "time_build_seconds" => round(time_build, digits=2),
