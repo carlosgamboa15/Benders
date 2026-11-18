@@ -18,6 +18,20 @@ tail -f julia_ID.out julia_ID.err # acompañar al mismo tiempo
 
 sed -i 's/\r$//' execute_julia.sh # corregir error de espacios de Windows
 
-python3 -m json.tool results/progress.json | less # para acompañar el json de progreso
+python3 -m json.tool results/progress.json | less # para acompañar el json de progresso
 
-Submitted batch job 3657788
+ls -lh --time-style=long-iso main.jl # consultar la última actualización de um archivo
+
+sacct -u "$USER" \
+  --format=JobID,JobName,State,Elapsed,Start,End,ExitCode # porcesos ejecutados
+
+sacct -j 3669814 \
+  --format=JobID,JobName,State,Elapsed,ReqMem,MaxRSS,ExitCode # error limite de memoria
+ 
+scp -r cgamboa@picasso.scbi.um.es:~/Large_Scale_Picasso/results "C:\Users\espar\Downloads\run_N_10_B_2" # guardar resultados em máquina local
+
+find results/ -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + # limpiar la carpeta de results
+
+ls -lah results/ # comprovar que la carpeta results está vacia
+
+Submitted batch job 369874
