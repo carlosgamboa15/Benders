@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=julia_benders
 #SBATCH --nodes=1
-#SBATCH --ntasks=10
+#SBATCH --ntasks=5
 #SBATCH --cpus-per-task=1
-#SBATCH --time=20:00:00
 #SBATCH --mem=64G
+#SBATCH --time=20:00:00
 #SBATCH --output=julia_%j.out
 #SBATCH --error=julia_%j.err
 

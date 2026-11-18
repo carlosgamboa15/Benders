@@ -39,11 +39,13 @@ function save_progress_event(event)
 end
 
 function start_monitor()
+
     state = Dict{String,Any}(
         "step" => "initialization",
         "iteration" => 0,
         "subproblem_iteration" => 0,
         "last_update" => string(now()),
+        "last_event" => nothing,
         "workers" => nworkers(),
         "subproblems" => Dict{String,Any}()
     )
@@ -51,40 +53,64 @@ function start_monitor()
     save_progress(state)
 
     return @async begin
+
         while true
+
             event = take!(PROGRESS_CHANNEL)
             event_type = event["type"]
 
             save_progress_event(event)
 
+            state["last_update"] = string(now())
+            state["last_event"] = event_type
+
             if event_type == "TERMINATE"
-                state["last_update"] = string(now())
                 save_progress(state)
                 break
-            end
 
-            state["last_update"] = string(now())
+            elseif event_type == "STEP"
 
-            if event_type == "STEP"
                 state["step"] = event["stage"]
                 state["iteration"] = event["iteration"]
                 state["subproblem_iteration"] = 0
                 state["subproblems"] = Dict{String,Any}()
+
                 for key in ("benders", "master", "oracles", "cuts")
                     delete!(state, key)
                 end
 
             elseif event_type == "SUBPROBLEM"
-                if state["subproblem_iteration"] != event["iteration"]
+
+                event_iter = event["iteration"]
+
+                if event_iter < state["subproblem_iteration"]
+                    save_progress(state)
+                    continue
+                end
+
+                if state["subproblem_iteration"] != event_iter
                     state["subproblems"] = Dict{String,Any}()
-                    state["subproblem_iteration"] = event["iteration"]
+                    state["subproblem_iteration"] = event_iter
                 end
 
                 key = string(event["subproblem"])
+
                 state["subproblems"][key] = event
-                state["iteration"] = event["iteration"]
+                state["iteration"] = event_iter
+
             elseif event_type == "MASTER"
+
                 state["master"] = event
+                state["iteration"] = event["iteration"]
+
+            elseif event_type == "ORACLES"
+
+                state["oracles"] = event
+                state["iteration"] = event["iteration"]
+
+            elseif event_type == "CUTS"
+
+                state["cuts"] = event
                 state["iteration"] = event["iteration"]
 
             elseif event_type in (
@@ -92,6 +118,7 @@ function start_monitor()
                 "WARM_BENDERS",
                 "BENDERS_WITHOUT_WARM_START"
             )
+
                 state["iteration"] = event["iteration"]
 
                 state["benders"] = Dict(
@@ -99,11 +126,15 @@ function start_monitor()
                     "UB" => event["UB"],
                     "gap" => event["gap"]
                 )
+
             end
 
             save_progress(state)
+
         end
+
     end
+
 end
 
 println("Starting SLURM workers...")
@@ -146,6 +177,34 @@ println("Number of workers: ", nworkers())
 end
 
 Data = Main.getData.Data
+
+@everywhere function memory_rss_gb()
+    try
+        for line in eachline("/proc/self/status")
+            if startswith(line, "VmRSS:")
+                kb = parse(Int, split(line)[2])
+                return round(kb / 1024^2, digits=3)
+            end
+        end
+    catch
+    end
+
+    return nothing
+end
+
+@everywhere function memory_peak_gb()
+    try
+        for line in eachline("/proc/self/status")
+            if startswith(line, "VmHWM:")
+                kb = parse(Int, split(line)[2])
+                return round(kb / 1024^2, digits=3)
+            end
+        end
+    catch
+    end
+
+    return nothing
+end
 
 function scenarios(Data)
 
@@ -570,18 +629,28 @@ end
 @everywhere function solve_oracle_problem(data, iter, n)
 
     start = time()
+    start_datetime = string(now())
 
-    put!(WORKER_PROGRESS_CHANNEL, Dict(
-        "type" => "SUBPROBLEM",
-        "iteration" => iter,
-        "subproblem" => n,
-        "state" => "RUNNING",
-        "worker" => myid(),
-        "node" => gethostname(),
-        "start" => string(now()),
-        "finish" => nothing,
-        "duration_seconds" => nothing
-    ))
+    function report_oracle(state; extra=Dict{String,Any}())
+        event = Dict{String,Any}(
+            "type" => "SUBPROBLEM",
+            "iteration" => iter,
+            "subproblem" => n,
+            "state" => state,
+            "worker" => myid(),
+            "node" => gethostname(),
+            "start" => start_datetime,
+            "finish" => nothing,
+            "duration_seconds" => round(time() - start, digits=2),
+            "memory_gb" => memory_rss_gb(),
+            "memory_peak_gb" => memory_peak_gb()
+        )
+
+        merge!(event, extra)
+        put!(WORKER_PROGRESS_CHANNEL, event)
+    end
+
+    report_oracle("RUNNING")
 
     Data = data.Data
     D = Data.D
@@ -599,7 +668,7 @@ end
 
     zstar = data.zstar
     PredictionStar = data.PredictionStar
-    
+
     Tf = Data.Tf
     number_of_generators = Data.Ig
     bus_renewable_generation = Data.bus_renewable_generation
@@ -608,34 +677,93 @@ end
     RD = Data.RD
     Pmin = Data.Pmin
     Pmax = Data.Pmax
-    number_of_generators = Data.Ig
 
     p0 = zeros(number_of_generators)
     u0 = zeros(number_of_generators)
 
-    T = collect(1:Tf)   
+    T = collect(1:Tf)
     Ig = collect(1:number_of_generators)
-    a = max.(Ξ_y[:,1], -vcat(PredictionStar...))
-    b = Ξ_y[:,2]
+
+    a = max.(Ξ_y[:, 1], -vcat(PredictionStar...))
+    b = Ξ_y[:, 2]
     zstar_global = vcat(zstar...)
 
     violation = true
 
-    m_oracle, obj  = create_oracle_problem(Data)
+   report_oracle("BUILDING")
 
-    # set_optimizer(m_oracle, optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "NonConvex" => 2, "MIPGap" => 1e-3, "LogFile" => log_filename))
-    set_optimizer(m_oracle, optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "MIPGap" => 1e-3))
+    build_start = time()
 
-    val, time_oracle = @timed(begin
-        # modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
-        modify_oracle_linearized(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
-        optimize!(m_oracle)
-        status = termination_status(m_oracle)
-        if status != MOI.OPTIMAL
-            error("Subproblem n = $n, Oracle Status: $(status)" )
-        end
-    end)
-    println("Optimization completed  n = $n time = $time_oracle")
+    m_oracle, obj = create_oracle_problem(Data)
+
+    set_optimizer(
+        m_oracle,
+        optimizer_with_attributes(
+            () -> Gurobi.Optimizer(GUROBI_ENV),
+            "OutputFlag" => 0,
+            "MIPGap" => 1e-3,
+            "Threads" => 1
+        )
+    )
+
+    time_build = time() - build_start
+
+    report_oracle(
+        "BUILT",
+        extra=Dict(
+            "time_build_seconds" => round(time_build, digits=2)
+        )
+    )
+
+    report_oracle("MODIFYING")
+
+    modify_start = time()
+
+    modify_oracle_linearized(
+        Data, m_oracle, obj, y, Ξ_y, n,
+        u, v, w, λ, PredictionStar
+    )
+
+    time_modify = time() - modify_start
+
+    report_oracle(
+        "MODIFIED",
+        extra=Dict(
+            "time_modify_seconds" => round(time_modify, digits=2)
+        )
+    )
+
+    report_oracle("OPTIMIZING")
+
+    optimize_start = time()
+
+    optimize!(m_oracle)
+
+    time_optimize = time() - optimize_start
+
+    status = termination_status(m_oracle)
+
+    report_oracle(
+        "OPTIMIZED",
+        extra=Dict(
+            "time_optimize_seconds" => round(time_optimize, digits=2),
+            "termination_status" => string(status)
+        )
+    )
+
+    if status != MOI.OPTIMAL
+        error("Subproblem n = $n, Oracle Status: $(status)")
+    end
+
+    time_oracle = time_modify + time_optimize
+
+    println(
+        "Oracle n=$n | ",
+        "build=$(round(time_build, digits=2)) s | ",
+        "modify=$(round(time_modify, digits=2)) s | ",
+        "optimize=$(round(time_optimize, digits=2)) s | ",
+        "memory=$(memory_rss_gb()) GiB"
+    )
 
     obj_val = objective_value(m_oracle)
     viol = μ[n] + θ - obj_val + λ*norm(zstar_global - z[n],1)
@@ -649,7 +777,7 @@ end
     y_opt = yproj .+ ηpos .* Δpos .- ηneg .* Δneg
     yopt = @views [y_opt[((b - 1) * Tf + 1):(b * Tf)] for b in 1:length(bus_renewable_generation)]
 
-    const_term_x1, const_term_x2, const_term_x3, const_term_x4, const_term_x5, const_term_x6 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    const_term_x1, const_term_x2, const_term_x3, const_term_x4, const_term_x5, const_term_x6 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     π =  Dict("($b, $t)" => 0.0  for b in bus_renewable_generation, t in T)
     π_s =  Dict("($b, $t)" => 0.0  for b in bus_renewable_generation, t in T)
@@ -736,17 +864,17 @@ end
         oracle_solution = oracle_solution,
     )
 
-    put!(WORKER_PROGRESS_CHANNEL, Dict(
-        "type" => "SUBPROBLEM",
-        "iteration" => iter,
-        "subproblem" => n,
-        "state" => "COMPLETED",
-        "worker" => myid(),
-        "node" => gethostname(),
-        "start" => string(now() - Millisecond(round(Int, (time() - start) * 1000))),
-        "finish" => string(now()),
-        "duration_seconds" => round(time() - start, digits=2)
-    ))
+    report_oracle(
+        "COMPLETED",
+        extra=Dict(
+            "finish" => string(now()),
+            "duration_seconds" => round(time() - start, digits=2),
+            "time_build_seconds" => round(time_build, digits=2),
+            "time_modify_seconds" => round(time_modify, digits=2),
+            "time_optimize_seconds" => round(time_optimize, digits=2),
+            "time_oracle_seconds" => round(time_oracle, digits=2)
+        )
+    )
 
     return result
     
