@@ -458,24 +458,46 @@ end
     return model
 end
 
-@everywhere function create_oracle_problem(Data)
+@everywhere function create_oracle_problem(Data, u, v, w)
 
     Tf = Data.Tf
-    number_of_generators = Data.Ig
     bus_renewable_generation = Data.bus_renewable_generation
     T = collect(1:Tf)
 
-    u = zeros(number_of_generators, Tf)
-    v = zeros(number_of_generators, Tf)
-    w = zeros(number_of_generators, Tf)
-
+    # Construir el despacho económico con la solución
+    # actual del maestro
     m = economic_dispatch_problem(Data, u, v, w)
-    m_oracle = dualize(m; dual_names = DualNames())
-   
-    @variable(m_oracle, ηpos[b in bus_renewable_generation, t in T], Bin)
-    @variable(m_oracle, ηneg[b in bus_renewable_generation, t in T], Bin)
-    @constraint(m_oracle, [b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 1)
-    @constraint(m_oracle,  positive[b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 0)
+
+    # Dualizar el problema primal
+    m_oracle = dualize(
+        m;
+        dual_names = DualNames()
+    )
+
+    # Variables binarias de incertidumbre
+    @variable(
+        m_oracle,
+        ηpos[b in bus_renewable_generation, t in T],
+        Bin
+    )
+
+    @variable(
+        m_oracle,
+        ηneg[b in bus_renewable_generation, t in T],
+        Bin
+    )
+
+    @constraint(
+        m_oracle,
+        [b in bus_renewable_generation, t in T],
+        ηpos[b,t] + ηneg[b,t] <= 1
+    )
+
+    @constraint(
+        m_oracle,
+        positive[b in bus_renewable_generation, t in T],
+        ηpos[b,t] + ηneg[b,t] <= 0
+    )
 
     obj = objective_function(m_oracle)
 
@@ -597,33 +619,28 @@ end
     set_objective_function(m_oracle, obj + ex - λ * norm(yproj_aux - y_n, 1))
 
     for t in T
+        for b in bus_renewable_generation
 
-            for b in bus_renewable_generation
+            r = ind_renewable_generation[b]
 
-                REG = PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]
+            REG = PredictionStar[r][t] + yproj[r][t]
 
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
-                set_normalized_rhs(m_oracle[:positive][b, t], REG)
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηpos][b,t],
+                -Δpos[r][t]
+            )
 
-            end
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηneg][b,t],
+                Δneg[r][t]
+            )
 
-        for i in Ig
-
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x1[$i,$t]")], Pmax[i]*round(Int, u[i, t]))
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x2[$i,$t]")], Pmin[i]*round(Int, u[i, t]))
-
-            if t == 1
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x5[$i,$t]")], RU[i]*u0[i] + Pmax[i]*round(Int,v[i, t]) + p0[i])
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x6[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]) - p0[i])                
-
-            else
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x3[$i,$t]")], RU[i]*round(Int, u[i, t-1]) + Pmax[i]*round(Int, v[i, t]))
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x4[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]))
-
-            end
+            set_normalized_rhs(
+                m_oracle[:positive][b,t],
+                REG
+            )
         end
     end
 
@@ -697,33 +714,28 @@ end
     set_objective_function(m_oracle, obj + ex - λ * norm(yproj_aux - y_n, 1))
 
     for t in T
+        for b in bus_renewable_generation
 
-            for b in bus_renewable_generation
+            r = ind_renewable_generation[b]
 
-                REG = PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]
+            REG = PredictionStar[r][t] + yproj[r][t]
 
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
-                set_normalized_rhs(m_oracle[:positive][b, t], REG)
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηpos][b,t],
+                -Δpos[r][t]
+            )
 
-            end
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηneg][b,t],
+                Δneg[r][t]
+            )
 
-        for i in Ig
-
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x1[$i,$t]")], Pmax[i]*round(Int, u[i, t]))
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x2[$i,$t]")], Pmin[i]*round(Int, u[i, t]))
-
-            if t == 1
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x5[$i,$t]")], RU[i]*u0[i] + Pmax[i]*round(Int,v[i, t]) + p0[i])
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x6[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]) - p0[i])                
-
-            else
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x3[$i,$t]")], RU[i]*round(Int, u[i, t-1]) + Pmax[i]*round(Int, v[i, t]))
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x4[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]))
-
-            end
+            set_normalized_rhs(
+                m_oracle[:positive][b,t],
+                REG
+            )
         end
     end
 
@@ -763,10 +775,14 @@ end
 
 end
 
-@everywhere function modify_oracle_bilinear(Data, m_oracle, obj, y, Ξ_y, n, u, v, w, λ, PredictionStar)
+
+@everywhere function modify_oracle_bilinear(
+    Data, m_oracle, y, Ξ_y, n, u, v, w, λ, PredictionStar
+)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
+
     D = Data.D
     Pmin = Data.Pmin
     Pmax = Data.Pmax
@@ -781,16 +797,22 @@ end
 
     T = collect(1:Tf)
     Ig = collect(1:number_of_generators)
+
     Tb_renewable = length(bus_renewable_generation)
 
     y_n = y[n]
 
-    lower = max.(Ξ_y[:, 1], -vcat(PredictionStar...))
+    lower = max.(
+        Ξ_y[:, 1],
+        -vcat(PredictionStar...)
+    )
+
     upper = Ξ_y[:, 2]
 
     yproj_aux = clamp.(y_n, lower, upper)
-    Δpos_aux = upper - yproj_aux
-    Δneg_aux = yproj_aux - lower
+
+    Δpos_aux = upper .- yproj_aux
+    Δneg_aux = yproj_aux .- lower
 
     yproj = @views [
         yproj_aux[((b - 1) * Tf + 1):(b * Tf)]
@@ -816,7 +838,7 @@ end
 
     for b in bus_renewable_generation, t in T
 
-        π_bt  = m_oracle[Symbol("π[$b,$t]")]
+        π_bt = m_oracle[Symbol("π[$b,$t]")]
         πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
 
         @constraint(m_oracle, -M <= π_bt <= M)
@@ -824,41 +846,7 @@ end
 
     end
 
-    ex = sum(
-        begin
-            r = ind_renewable_generation[b]
-
-            π_bt  = m_oracle[Symbol("π[$b,$t]")]
-            πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
-
-            REG = PredictionStar[r][t] + yproj[r][t]
-
-            Δp = Δpos[r][t]
-            Δn = Δneg[r][t]
-
-            π_bt * (D[b][t] - REG)
-
-            - Δp * π_bt * ηpos[b,t]
-            + Δn * π_bt * ηneg[b,t]
-
-            + πs_bt * REG
-
-            + Δp * πs_bt * ηpos[b,t]
-            - Δn * πs_bt * ηneg[b,t]
-
-            - λ * Δp * ηpos[b,t]
-            - λ * Δn * ηneg[b,t]
-        end
-        for b in bus_renewable_generation, t in T
-    )
-
-    set_objective_function(
-        m_oracle,
-        obj + ex - λ * norm(yproj_aux - y_n, 1)
-    )
-
     for t in T
-
         for b in bus_renewable_generation
 
             r = ind_renewable_generation[b]
@@ -867,13 +855,13 @@ end
 
             set_normalized_coefficient(
                 m_oracle[:positive][b,t],
-                ηpos[b,t],
+                m_oracle[:ηpos][b,t],
                 -Δpos[r][t]
             )
 
             set_normalized_coefficient(
                 m_oracle[:positive][b,t],
-                ηneg[b,t],
+                m_oracle[:ηneg][b,t],
                 Δneg[r][t]
             )
 
@@ -881,60 +869,56 @@ end
                 m_oracle[:positive][b,t],
                 REG
             )
-
-        end
-
-        for i in Ig
-
-            set_objective_coefficient(
-                m_oracle,
-                m_oracle[Symbol("x1[$i,$t]")],
-                Pmax[i] * round(Int, u[i,t])
-            )
-
-            set_objective_coefficient(
-                m_oracle,
-                m_oracle[Symbol("x2[$i,$t]")],
-                Pmin[i] * round(Int, u[i,t])
-            )
-
-            if t == 1
-
-                set_objective_coefficient(
-                    m_oracle,
-                    m_oracle[Symbol("x5[$i,$t]")],
-                    RU[i] * u0[i] +
-                    Pmax[i] * round(Int, v[i,t]) +
-                    p0[i]
-                )
-
-                set_objective_coefficient(
-                    m_oracle,
-                    m_oracle[Symbol("x6[$i,$t]")],
-                    RD[i] * round(Int, u[i,t]) +
-                    Pmax[i] * round(Int, w[i,t]) -
-                    p0[i]
-                )
-
-            else
-
-                set_objective_coefficient(
-                    m_oracle,
-                    m_oracle[Symbol("x3[$i,$t]")],
-                    RU[i] * round(Int, u[i,t-1]) +
-                    Pmax[i] * round(Int, v[i,t])
-                )
-
-                set_objective_coefficient(
-                    m_oracle,
-                    m_oracle[Symbol("x4[$i,$t]")],
-                    RD[i] * round(Int, u[i,t]) +
-                    Pmax[i] * round(Int, w[i,t])
-                )
-
-            end
         end
     end
+
+    ex = sum(
+        begin
+
+            r = ind_renewable_generation[b]
+
+            π_bt = m_oracle[Symbol("π[$b,$t]")]
+            πs_bt = m_oracle[Symbol("π_s[$b,$t]")]
+
+            REG = PredictionStar[r][t] + yproj[r][t]
+
+            Δp = Δpos[r][t]
+            Δn = Δneg[r][t]
+
+            (
+                π_bt * (D[b][t] - REG)
+
+                - Δp * π_bt * ηpos[b,t]
+                + Δn * π_bt * ηneg[b,t]
+
+                + πs_bt * REG
+
+                + Δp * πs_bt * ηpos[b,t]
+                - Δn * πs_bt * ηneg[b,t]
+
+                - λ * Δp * ηpos[b,t]
+                - λ * Δn * ηneg[b,t]
+            )
+
+        end
+        for b in bus_renewable_generation, t in T
+    )
+
+    obj_updated = objective_function(m_oracle)
+
+    set_objective_function(
+        m_oracle,
+        obj_updated +
+        ex -
+        λ * norm(yproj_aux - y_n, 1)
+    )
+
+
+    @assert objective_function(m_oracle) isa JuMP.QuadExpr (
+        "El objetivo bilineal no contiene una expresión cuadrática."
+    )
+
+    return m_oracle
 
 end
 
@@ -956,7 +940,9 @@ end
     )
 
     build_start = time()
-    m_oracle, obj = create_oracle_problem(Data)
+    m_oracle, obj = create_oracle_problem(
+        Data, data.u, data.v, data.w
+    )
 
     set_optimizer(
         m_oracle,
@@ -2279,7 +2265,7 @@ while ~convergence && iter ≤ Max_iter  && gap ≥ 1e-3
         "iteration" => iter,
         "LB" => LB_Benders,
         "UB" => UB_Benders,
-        "gap" => gap
+        "gap" => gap 
     ))
 
 end
