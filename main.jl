@@ -578,7 +578,7 @@ end
 
 end
 
-@everywhere function modify_oracle_linearized(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+@everywhere function modify_oracle_linearized(Data, m_oracle, obj, y, Ξ_y, n, λ, PredictionStar)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -673,7 +673,7 @@ end
 
 end
 
-@everywhere function modify_oracle_inidicator_constraints(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+@everywhere function modify_oracle_inidicator_constraints(Data, m_oracle, obj, y, Ξ_y, n, λ, PredictionStar)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -776,9 +776,7 @@ end
 end
 
 
-@everywhere function modify_oracle_bilinear(
-    Data, m_oracle, y, Ξ_y, n, u, v, w, λ, PredictionStar
-)
+@everywhere function modify_oracle_bilinear(Data, m_oracle, y, Ξ_y, n, λ, PredictionStar)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -967,7 +965,6 @@ end
         modify_oracle_linearized(
             Data, m_oracle, obj,
             data.y, data.Ξ_y, n,
-            data.u, data.v, data.w,
             data.λ, data.PredictionStar
         )
 
@@ -975,15 +972,13 @@ end
         modify_oracle_inidicator_constraints(
             Data, m_oracle, obj,
             data.y, data.Ξ_y, n,
-            data.u, data.v, data.w,
             data.λ, data.PredictionStar
         )
 
     elseif formulation == :bilinear
         modify_oracle_bilinear(
-            Data, m_oracle, obj,
+            Data, m_oracle, 
             data.y, data.Ξ_y, n,
-            data.u, data.v, data.w,
             data.λ, data.PredictionStar
         )
 
